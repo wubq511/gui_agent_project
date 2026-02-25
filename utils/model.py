@@ -1,101 +1,176 @@
 import base64
+import hashlib
 import json
 import os
 import time
-import hashlib
 from functools import lru_cache
+from io import BytesIO
+from typing import Any, Dict, List
+
 from openai import OpenAI
-from typing import List, Dict, Any, Optional
-import threading
+from PIL import Image
 
 
 class Model:
-    """模型枚举"""
     GEMINI_3_PRO = "gemini-3-pro"
     GEMINI_3_FLASH = "gemini-3-flash-preview"
 
 
-class PerformanceStats:
-    """性能统计工具类"""
+class PerformanceMetrics:
     def __init__(self):
-        self.stats: Dict[str, List[float]] = {}
-        self._lock = threading.Lock()
-    
-    def record(self, operation: str, duration: float):
-        with self._lock:
-            if operation not in self.stats:
-                self.stats[operation] = []
-            self.stats[operation].append(duration)
-    
-    def get_summary(self) -> Dict[str, Dict[str, float]]:
-        with self._lock:
-            summary = {}
-            for op, times in self.stats.items():
-                if times:
-                    summary[op] = {
-                        "count": len(times),
-                        "total": sum(times),
-                        "avg": sum(times) / len(times),
-                        "min": min(times),
-                        "max": max(times),
-                    }
-            return summary
+        self.api_calls = 0
+        self.total_api_time = 0.0
+        self.total_encode_time = 0.0
+        self.total_compress_time = 0.0
+        self.cache_hits = 0
+        self.cache_misses = 0
+
+    def record_api_call(self, duration: float):
+        self.api_calls += 1
+        self.total_api_time += duration
+
+    def record_encode(self, duration: float):
+        self.total_encode_time += duration
+
+    def record_compress(self, duration: float):
+        self.total_compress_time += duration
+
+    def record_cache_hit(self):
+        self.cache_hits += 1
+
+    def record_cache_miss(self):
+        self.cache_misses += 1
+
+    def get_summary(self) -> Dict[str, Any]:
+        avg_api_time = (
+            self.total_api_time / self.api_calls if self.api_calls > 0 else 0
+        )
+        cache_hit_rate = (
+            self.cache_hits / (self.cache_hits + self.cache_misses)
+            if (self.cache_hits + self.cache_misses) > 0
+            else 0
+        )
+        return {
+            "api_calls": self.api_calls,
+            "total_api_time": round(self.total_api_time, 2),
+            "avg_api_time": round(avg_api_time, 2),
+            "total_encode_time": round(self.total_encode_time, 2),
+            "total_compress_time": round(self.total_compress_time, 2),
+            "cache_hits": self.cache_hits,
+            "cache_misses": self.cache_misses,
+            "cache_hit_rate": f"{cache_hit_rate:.1%}",
+        }
 
 
-PERF_STATS = PerformanceStats()
+class ImageProcessor:
+    IMAGE_QUALITY = int(os.getenv("GUI_AGENT_IMAGE_QUALITY", "80"))
+    MAX_IMAGE_SIZE = int(os.getenv("GUI_AGENT_MAX_IMAGE_SIZE", "1280"))
+    ENABLE_COMPRESSION = os.getenv("GUI_AGENT_ENABLE_COMPRESSION", "true").lower() == "true"
 
+    _cache: Dict[str, str] = {}
+    _cache_max_size = int(os.getenv("GUI_AGENT_CACHE_SIZE", "50"))
 
-class ImageCache:
-    """图片编码缓存，避免重复编码相同图片"""
-    def __init__(self, max_size: int = 100):
-        self._cache: Dict[str, str] = {}
-        self._max_size = max_size
-        self._lock = threading.Lock()
-    
-    def get_or_encode(self, image_path: str) -> str:
-        cache_key = self._get_cache_key(image_path)
-        
-        with self._lock:
-            if cache_key in self._cache:
-                return self._cache[cache_key]
-        
-        with open(image_path, "rb") as image_file:
-            encoded = base64.b64encode(image_file.read()).decode("utf-8")
-        
-        with self._lock:
-            if len(self._cache) >= self._max_size:
-                self._cache.pop(next(iter(self._cache)))
-            self._cache[cache_key] = encoded
-        
-        return encoded
-    
-    def _get_cache_key(self, image_path: str) -> str:
+    @classmethod
+    def _compute_hash(cls, image_path: str) -> str:
+        hasher = hashlib.md5()
+        with open(image_path, "rb") as f:
+            for chunk in iter(lambda: f.read(65536), b""):
+                hasher.update(chunk)
+        return hasher.hexdigest()
+
+    @classmethod
+    def _resize_if_needed(cls, img: Image.Image) -> Image.Image:
+        width, height = img.size
+        max_dim = max(width, height)
+        if max_dim > cls.MAX_IMAGE_SIZE:
+            scale = cls.MAX_IMAGE_SIZE / max_dim
+            new_width = int(width * scale)
+            new_height = int(height * scale)
+            img = img.resize((new_width, new_height), Image.Resampling.LANCZOS)
+            print(f"    📐 图片缩放: {width}x{height} -> {new_width}x{new_height}")
+        return img
+
+    @classmethod
+    def compress_and_encode(
+        cls, image_path: str, metrics: PerformanceMetrics = None
+    ) -> str:
+        compress_start = time.perf_counter()
+
+        if cls.ENABLE_COMPRESSION:
+            file_hash = cls._compute_hash(image_path)
+            if file_hash in cls._cache:
+                if metrics:
+                    metrics.record_cache_hit()
+                print(f"    🎯 图片缓存命中")
+                return cls._cache[file_hash]
+
+            if metrics:
+                metrics.record_cache_miss()
+
         try:
-            mtime = os.path.getmtime(image_path)
-            size = os.path.getsize(image_path)
-            return f"{image_path}:{mtime}:{size}"
-        except OSError:
-            return image_path
-    
-    def clear(self):
-        with self._lock:
-            self._cache.clear()
+            img = Image.open(image_path)
+            if img.mode in ("RGBA", "P"):
+                img = img.convert("RGB")
 
+            if cls.ENABLE_COMPRESSION:
+                img = cls._resize_if_needed(img)
 
-IMAGE_CACHE = ImageCache()
+                buffer = BytesIO()
+                img.save(buffer, format="JPEG", quality=cls.IMAGE_QUALITY, optimize=True)
+                compressed_size = buffer.tell()
+                original_size = os.path.getsize(image_path)
+                compression_ratio = (1 - compressed_size / original_size) * 100
+                print(
+                    f"    🗜️ 图片压缩: {original_size / 1024:.1f}KB -> {compressed_size / 1024:.1f}KB ({compression_ratio:.1f}% 减少)"
+                )
+
+                encode_start = time.perf_counter()
+                base64_str = base64.b64encode(buffer.getvalue()).decode("utf-8")
+                if metrics:
+                    metrics.record_encode(time.perf_counter() - encode_start)
+
+                if len(cls._cache) >= cls._cache_max_size:
+                    oldest_key = next(iter(cls._cache))
+                    del cls._cache[oldest_key]
+                cls._cache[file_hash] = base64_str
+
+            else:
+                encode_start = time.perf_counter()
+                with open(image_path, "rb") as f:
+                    base64_str = base64.b64encode(f.read()).decode("utf-8")
+                if metrics:
+                    metrics.record_encode(time.perf_counter() - encode_start)
+
+        except Exception as e:
+            print(f"    ⚠️ 图片处理失败，使用原始方式: {e}")
+            encode_start = time.perf_counter()
+            with open(image_path, "rb") as f:
+                base64_str = base64.b64encode(f.read()).decode("utf-8")
+            if metrics:
+                metrics.record_encode(time.perf_counter() - encode_start)
+
+        if metrics:
+            metrics.record_compress(time.perf_counter() - compress_start)
+
+        return base64_str
+
+    @classmethod
+    def clear_cache(cls):
+        cls._cache.clear()
+        print("🗑️ 图片缓存已清空")
 
 
 class GeminiChat:
-    """通过灵芽API调用Gemini的多模态聊天类（优化版）"""
-
     def __init__(
-        self, 
-        api_key: str = None, 
+        self,
+        api_key: str | None = None,
         model: str = Model.GEMINI_3_FLASH,
-        max_history: int = 10,
+        max_history_turns: int = 3,
+        max_tokens: int = 512,
+        enable_compression: bool = True,
         max_retries: int = 3,
-        retry_delay: float = 1.0,
-    ):
+        timeout: float = 30.0,
+    ) -> None:
         self.api_key = api_key or os.getenv("LINGYAAI_API_KEY")
         if not self.api_key:
             raise ValueError(
@@ -103,83 +178,61 @@ class GeminiChat:
                 "或在初始化 GeminiChat 时传入 api_key 参数。"
             )
         self.model = model
-        self.max_history = max_history
         self.max_retries = max_retries
-        self.retry_delay = retry_delay
-        
+        self.timeout = timeout
+
         self.client = OpenAI(
             api_key=self.api_key,
             base_url="https://api.lingyaai.cn/v1",
-            timeout=60.0,
+            timeout=self.timeout,
+            max_retries=max_retries,
         )
+
         self.conversation_history: List[Dict[str, Any]] = []
-        self._history_lock = threading.Lock()
+        self.max_history_turns = max(0, int(max_history_turns))
+        self.max_tokens = max(64, int(max_tokens))
+        self.metrics = PerformanceMetrics()
+        self.enable_compression = enable_compression
 
-    def _encode_image(self, image_path: str) -> str:
-        return IMAGE_CACHE.get_or_encode(image_path)
+        print(f"🔧 GeminiChat 初始化完成:")
+        print(f"   - 模型: {model}")
+        print(f"   - 历史轮数: {max_history_turns}")
+        print(f"   - 最大tokens: {max_tokens}")
+        print(f"   - 图片压缩: {'启用' if enable_compression else '禁用'}")
+        print(f"   - 超时时间: {timeout}s")
+        print(f"   - 最大重试: {max_retries}")
 
-    def _trim_history(self):
-        """限制历史记录长度，防止无限增长"""
-        with self._history_lock:
-            if len(self.conversation_history) > self.max_history * 2:
-                keep_count = self.max_history * 2
-                self.conversation_history = self.conversation_history[-keep_count:]
+    def _build_history_messages(self) -> List[Dict[str, Any]]:
+        if not self.conversation_history or self.max_history_turns <= 0:
+            return []
+        max_messages = self.max_history_turns * 2
+        return self.conversation_history[-max_messages:]
 
-    def _call_api_with_retry(
-        self, 
-        messages: List[Dict[str, Any]]
-    ) -> Optional[str]:
-        """带重试机制的API调用"""
-        last_error = None
-        
-        for attempt in range(self.max_retries):
-            try:
-                start_time = time.time()
-                
-                response = self.client.chat.completions.create(
-                    model=self.model,
-                    messages=messages,
-                    max_tokens=2048,
-                    temperature=0.1,
-                )
-                
-                duration = time.time() - start_time
-                PERF_STATS.record("api_call", duration)
-                
-                if hasattr(response, "choices"):
-                    return response.choices[0].message.content
-                else:
-                    last_error = "API响应格式异常"
-                    
-            except Exception as e:
-                last_error = str(e)
-                if attempt < self.max_retries - 1:
-                    wait_time = self.retry_delay * (2 ** attempt)
-                    print(f"⚠️ API调用失败，{wait_time}秒后重试 ({attempt + 1}/{self.max_retries})")
-                    time.sleep(wait_time)
-        
-        return None
+    def _append_history(self, user_text: str, assistant_text: str) -> None:
+        if self.max_history_turns <= 0:
+            return
+        self.conversation_history.append(
+            {"role": "user", "content": user_text}
+        )
+        self.conversation_history.append(
+            {"role": "assistant", "content": assistant_text}
+        )
+        max_messages = self.max_history_turns * 2
+        if len(self.conversation_history) > max_messages:
+            self.conversation_history = self.conversation_history[-max_messages:]
 
     def get_multimodal_response(
-        self, 
-        text: str, 
-        image_paths: str, 
-        use_history: bool = True
+        self, text: str, image_paths: str, use_history: bool = True
     ) -> str:
-        """支持记忆的图文对话（优化版）"""
-        start_time = time.time()
-        
-        encode_start = time.time()
-        base64_image = self._encode_image(image_paths)
-        encode_duration = time.time() - encode_start
-        PERF_STATS.record("image_encode", encode_duration)
+        base64_image = ImageProcessor.compress_and_encode(
+            image_paths, self.metrics if self.enable_compression else None
+        )
 
-        messages = []
-        if use_history:
-            with self._history_lock:
-                messages.extend(self.conversation_history)
+        messages: List[Dict[str, Any]] = []
+        if use_history and self.conversation_history:
+            messages.extend(self._build_history_messages())
 
-        current_message = {
+        current_message: Dict[str, Any] = {
             "role": "user",
             "content": [
                 {
@@ -191,40 +244,60 @@ class GeminiChat:
         }
         messages.append(current_message)
 
-        print(f"🔄 正在调用API，模型: {self.model}，历史消息数: {len(messages)-1}")
+        api_start = time.perf_counter()
+        try:
+            print(f"🔄 正在调用API，模型: {self.model}")
 
-        result_text = self._call_api_with_retry(messages)
-        
-        if result_text is None:
-            error_msg = f"API调用失败: {last_error if 'last_error' in dir() else '未知错误'}"
-            print(f"❌ {error_msg}")
+            response = self.client.chat.completions.create(
+                model=self.model,
+                messages=messages,
+                max_tokens=self.max_tokens,
+                temperature=0.1,
+            )
+
+            api_duration = time.perf_counter() - api_start
+            self.metrics.record_api_call(api_duration)
+            print(f"⏱️ API调用耗时: {api_duration:.2f}s")
+
+            if hasattr(response, "choices"):
+                result_text = response.choices[0].message.content
+                print(f"✅ 成功获取响应，内容长度: {len(result_text)}")
+            else:
+                error_msg = "API响应格式异常"
+                print(f"❌ {error_msg}")
+                return json.dumps(
+                    {"Thought": error_msg, "Action": "wait()"},
+                    ensure_ascii=False,
+                )
+
+        except Exception as e:
+            api_duration = time.perf_counter() - api_start
+            self.metrics.record_api_call(api_duration)
+            error_detail = f"API调用异常: {str(e)}"
+            print(f"❌ {error_detail}")
             return json.dumps(
-                {"Thought": error_msg, "Action": "wait()"},
+                {"Thought": error_detail, "Action": "wait()"},
                 ensure_ascii=False,
             )
 
-        print(f"✅ 成功获取响应，内容长度: {len(result_text)}")
-
         if use_history:
-            with self._history_lock:
-                self.conversation_history.append(current_message)
-                self.conversation_history.append({
-                    "role": "assistant",
-                    "content": result_text,
-                })
-            self._trim_history()
+            self._append_history(text, result_text)
 
-        total_duration = time.time() - start_time
-        PERF_STATS.record("total_request", total_duration)
-        
         return result_text
 
     def clear_history(self):
-        """清空记忆"""
-        with self._history_lock:
-            self.conversation_history = []
+        self.conversation_history = []
+        ImageProcessor.clear_cache()
+        print("🗑️ 历史记录和图片缓存已清空")
 
-    @staticmethod
-    def get_performance_stats() -> Dict[str, Dict[str, float]]:
-        """获取性能统计"""
-        return PERF_STATS.get_summary()
+    def get_performance_summary(self) -> Dict[str, Any]:
+        return self.metrics.get_summary()
+
+    def print_performance_summary(self):
+        summary = self.get_performance_summary()
+        print("\n" + "=" * 50)
+        print("📊 性能统计摘要")
+        print("=" * 50)
+        for key, value in summary.items():
+            print(f"  {key}: {value}")
+        print("=" * 50)
